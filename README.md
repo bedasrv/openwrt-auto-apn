@@ -30,26 +30,88 @@ Two layers of redundancy:
 | `mcc-mnc-apn.txt` | 714 carriers, 12109 bytes flat file (MCCMNC→APN) |
 | `auto-apn-init.sh` | OpenWrt init script — sets APN at boot |
 | `99-auto-apn-hotplug.sh` | Hotplug script — handles SIM hot-swap |
+| `setup-dw5821e-modem.sh` | One-shot setup script for Dell DW5821e modem |
 
 ## Deployment
 
-Part of the DW5821e modem Ansible playbook:
+### One-shot script (recommended)
+
 ```bash
-cd ansible/playbooks
-ansible-playbook -i inventory.ini setup-dw5821e-modem.yml
+./setup-dw5821e-modem.sh                          # default: root@192.168.1.1
+./setup-dw5821e-modem.sh root@192.168.8.1         # custom IP
+./setup-dw5821e-modem.sh root@192.168.8.1 --force # re-run
 ```
 
-Or deploy manually:
+### Or deploy manually
+
 ```bash
 # Copy mapping
-cat mcc-mnc-apn.txt | ssh jump "ssh root@router 'cat > /etc/mcc-mnc-apn.txt'"
+cat mcc-mnc-apn.txt | ssh root@router 'cat > /etc/mcc-mnc-apn.txt'
 
 # Copy init script
-cat auto-apn-init.sh | ssh jump "ssh root@router 'cat > /etc/init.d/auto-apn && chmod +x /etc/init.d/auto-apn && /etc/init.d/auto-apn enable'"
+cat auto-apn-init.sh | ssh root@router 'cat > /etc/init.d/auto-apn && chmod +x /etc/init.d/auto-apn && /etc/init.d/auto-apn enable'
 
 # Copy hotplug
-cat 99-auto-apn-hotplug.sh | ssh jump "ssh root@router 'cat > /etc/hotplug.d/iface/99-auto-apn && chmod +x /etc/hotplug.d/iface/99-auto-apn'"
+cat 99-auto-apn-hotplug.sh | ssh root@router 'cat > /etc/hotplug.d/iface/99-auto-apn && chmod +x /etc/hotplug.d/iface/99-auto-apn'
 ```
+
+### Custom interface name
+
+If your modem interface is named something other than `wwan` (e.g. `secondwan`), edit both scripts and change the `IFACE` or `network.wwan` references:
+
+```bash
+# In auto-apn-init.sh, change:
+CURRENT=$(uci get network.wwan.apn 2>/dev/null)
+# to:
+CURRENT=$(uci get network.secondwan.apn 2>/dev/null)
+
+# Same for 99-auto-apn-hotplug.sh
+```
+
+## Prerequisites: DW5821e Modem Fix
+
+For Dell DW5821e / Foxconn T77W968 (413c:81d7) modems, the default `usb-mode.json` has an entry that forces **Config 0** (unconfigured state), causing driver cycling and ModemManager detection failures.
+
+**Symptoms in dmesg:**
+```
+usb 2-1: usbfs: interface 1 claimed by usbfs while 'usbmode' sets config #0
+qmi_wwan 2-1:1.0 wwan0: register → unregister (200ms cycle)
+```
+
+**Fix — remove the entry:**
+```bash
+# Remove 413c:81d7 from usb-mode.json
+sed -i '/"413c:81d7"/,/^[[:space:]]*},$/d' /etc/usb-mode.json
+
+# Verify removed
+grep -c '413c:81d7' /etc/usb-mode.json  # should return 0
+
+# Validate JSON
+python3 -c "import json; json.load(open('/etc/usb-mode.json')); print('valid')"
+
+# Reboot — modem will start clean in Config 1 (QMI)
+```
+
+The `setup-dw5821e-modem.sh` script does this automatically.
+
+## AmneziaWG Note: kmod vs Userspace
+
+If you use AmneziaWG with obfuscation params (Jc, Jmin, Jmax, S1-S4, H1-H4, I1), note that:
+
+- **`kmod-amneziawg`** is a vanilla WireGuard kernel module — it does NOT support obfuscation params
+- **`amneziawg-go`** (userspace, ~3MB Go binary) IS required for obfuscation
+
+**Fix — disable kernel module:**
+```bash
+# Rename .ko so modprobe can't find it
+mv /lib/modules/$(uname -r)/amneziawg.ko /lib/modules/$(uname -r)/amneziawg.ko.disabled
+rmmod amneziawg 2>/dev/null
+
+# ifup the interface — proto handler detects missing kmod and falls back to amneziawg-go
+ifdown awg0; ifup awg0
+```
+
+The proto handler (`/lib/netifd/proto/amneziawg.sh`) auto-detects: tries `modprobe amneziawg` first, falls back to `amneziawg-go` if the module isn't found. All obfuscation params are written to the temp config file and applied via `awg setconf`.
 
 ## Requirements
 
